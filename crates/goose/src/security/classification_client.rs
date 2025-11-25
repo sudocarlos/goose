@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
-/// Request format following HuggingFace Inference API specification
+/// Request format following HuggingFace Inference Text Classification API specification
 #[derive(Debug, Serialize)]
 struct ClassificationRequest {
     inputs: String,
@@ -18,11 +19,25 @@ struct ClassificationLabel {
 
 type ClassificationResponse = Vec<Vec<ClassificationLabel>>;
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct ModelEndpointInfo {
+    pub endpoint: String,
+    #[serde(flatten)]
+    pub extra_params: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelMappingConfig {
+    #[serde(flatten)]
+    pub models: HashMap<String, ModelEndpointInfo>,
+}
+
 pub struct ClassificationClient {
     endpoint_url: String,
     client: reqwest::Client,
     timeout: Duration,
     auth_token: Option<String>,
+    extra_params: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl ClassificationClient {
@@ -30,6 +45,15 @@ impl ClassificationClient {
         endpoint_url: String,
         timeout_ms: Option<u64>,
         auth_token: Option<String>,
+    ) -> Result<Self> {
+        Self::new_with_params(endpoint_url, timeout_ms, auth_token, None)
+    }
+
+    pub fn new_with_params(
+        endpoint_url: String,
+        timeout_ms: Option<u64>,
+        auth_token: Option<String>,
+        extra_params: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<Self> {
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(5000));
 
@@ -43,7 +67,52 @@ impl ClassificationClient {
             client,
             timeout,
             auth_token,
+            extra_params,
         })
+    }
+
+    pub fn from_model_name(
+        model_name: &str,
+        fallback_endpoint: Option<String>,
+        fallback_token: Option<String>,
+        timeout_ms: Option<u64>,
+    ) -> Result<Self> {
+        if let Ok(mapping_json) = std::env::var("ML_MODEL_MAPPING") {
+            if let Ok(mapping) = serde_json::from_str::<ModelMappingConfig>(&mapping_json) {
+                if let Some(model_info) = mapping.models.get(model_name) {
+                    tracing::info!(
+                        model_name = %model_name,
+                        endpoint = %model_info.endpoint,
+                        extra_params = ?model_info.extra_params,
+                        "Using model mapping for classification client"
+                    );
+
+                    return Self::new_with_params(
+                        model_info.endpoint.clone(),
+                        timeout_ms,
+                        None,
+                        Some(model_info.extra_params.clone()),
+                    );
+                }
+            }
+        }
+
+        match fallback_endpoint {
+            Some(endpoint) => {
+                tracing::info!(
+                    model_name = %model_name,
+                    endpoint = %endpoint,
+                    "Using fallback endpoint for classification client"
+                );
+                Self::new(endpoint, timeout_ms, fallback_token)
+            }
+            None => {
+                anyhow::bail!(
+                    "No model mapping found for '{}' and no fallback endpoint provided",
+                    model_name
+                )
+            }
+        }
     }
 
     pub async fn classify(&self, text: &str) -> Result<f32> {
@@ -51,11 +120,17 @@ impl ClassificationClient {
             endpoint = %self.endpoint_url,
             text_length = text.len(),
             timeout_ms = ?self.timeout.as_millis(),
+            extra_params = ?self.extra_params,
         );
+
+        let parameters = self
+            .extra_params
+            .as_ref()
+            .map(|params| serde_json::to_value(params).unwrap_or(serde_json::Value::Null));
 
         let request = ClassificationRequest {
             inputs: text.to_string(),
-            parameters: None, // Reserved for future use (e.g., truncation, max_length)
+            parameters,
         };
 
         let mut request_builder = self.client.post(&self.endpoint_url).json(&request);
